@@ -33,6 +33,7 @@ jobs:
           fetch-depth: 1
           sparse-checkout: |
             packs/pf2e/equipment
+            packs/pf2e/equipment-effects
             static/icons
 
       - name: Record upstream ref

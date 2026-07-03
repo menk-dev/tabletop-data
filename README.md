@@ -1,8 +1,9 @@
 # treasureboard-data
 
 The **kitchen** for TreasureBoard's PF2e equipment search: a tiny, self-contained repo that
-turns the fat Foundry VTT [`pf2e`](https://github.com/foundryvtt/pf2e) equipment pack into a
-slim, ready-to-serve bundle and publishes it as a GitHub Release asset.
+turns the fat Foundry VTT [`pf2e`](https://github.com/foundryvtt/pf2e) equipment and
+equipment-effects packs into a slim, ready-to-serve bundle and publishes it as a GitHub Release
+asset.
 
 Consuming apps (the Campaign Accountant backend, and anything else) never touch pf2e — they
 just download one small tarball from a stable URL and serve it. All pf2e knowledge lives here.
@@ -13,7 +14,8 @@ A daily GitHub Actions job rebuilds a bundle and, **only when upstream changed**
 it to the moving `data-latest` release. The tarball `treasureboard-data.tar.gz` contains:
 
 ```
-equipment.json     # array of slim records, sorted by id (stable)
+equipment.json     # array of slim item records, sorted by id (stable)
+effects.json       # array of slim "Effect: …" records equipment activates, sorted by id
 icons/<hash><ext>  # every referenced icon, deduped by content hash
 meta.json          # provenance + counts (also uploaded as a standalone asset)
 ```
@@ -40,7 +42,58 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
   "publicationTitle": "Pathfinder GM Core",
   "remaster": true,
   "baseItem": "alchemical-bomb",
-  "img": "ab12…f.webp"                // filename inside icons/ (.webp or .svg); null only if nothing resolved
+  "img": "ab12…f.webp",               // filename inside icons/ (.webp or .svg); null only if nothing resolved
+  "references": [                     // deduped outbound links parsed from the description
+    { "kind": "equipment", "name": "Crowbar (Levered)", "id": "4kz3…", "resolved": true },
+    { "kind": "spell", "name": "Fireball", "resolved": false }
+  ]
+}
+```
+
+### References
+
+Descriptions link other documents via Foundry `@UUID[…]` enrichers. Rather than flatten those to
+bare text (losing the link) we surface each one two ways:
+
+1. **Inline**, as a consistent anchor in `description`:
+   `<a class="ref" data-kind="equipment" data-id="4kz3…">Crowbar (Levered)</a>` for in-bundle
+   items, or `<a class="ref" data-kind="spell" data-name="Fireball">Fireball</a>` for everything
+   else. The anchor text is always the display name, so it degrades gracefully if you ignore the
+   attributes. (These are the *only* attributes the sanitizer keeps.)
+2. **Structured**, as the per-record `references[]` array above (deduped by kind + target).
+
+`kind` is a normalized category (`equipment`, `spell`, `condition`, `effect`, `action`, `feat`,
+`deity`, `creature`, …). **A link is resolved to a bundle-local `id` (`resolved:true`) only when
+it targets a pack we actually ship** — `kind:"equipment"` (into `equipment.json`) or
+`kind:"effect"` (into `effects.json`) — matched by name (names are unique within each pack). This
+makes the equipment↔effect relationship a closed graph in both directions (an item links to its
+`Effect: …`, and that effect links back to the item). Every other reference points at a pack this
+bundle doesn't ingest (spells, conditions, actions, and the non-equipment `*-effects` packs), so it
+carries `{kind, name}` with `resolved:false`: parseable and consistent, but the target lives
+outside the bundle. `meta.json` reports `refTotal` / `refResolved` and, as a health signal,
+`danglingRefs` — links into a *shipped* pack that nonetheless failed to resolve (expected 0).
+
+### `effects.json` record
+
+Same common fields as an item, minus `price`/`quantity`/`baseItem`, plus a `duration`. These are
+the rules an item applies when activated; equipment references them by `kind:"effect"`.
+
+```jsonc
+{
+  "id": "7Mgp…",
+  "name": "Effect: Vaultbreaker's Harness",
+  "type": "effect",
+  "level": 6,
+  "description": "…clean, safe HTML with <a class=\"ref\"> back-links…",
+  "rarity": "common",
+  "traits": [],
+  "duration": { "value": 1, "unit": "minutes", "sustained": false }, // null if none; -1 = indefinite
+  "publicationTitle": "Pathfinder #158: Sixty Feet Under",
+  "remaster": false,
+  "img": "cd34…f.webp",
+  "references": [
+    { "kind": "equipment", "name": "Vaultbreaker's Harness", "id": "Lmve…", "resolved": true }
+  ]
 }
 ```
 
@@ -57,13 +110,15 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
 
 ```jsonc
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "upstreamRepo": "foundryvtt/pf2e",
   "upstreamBranch": "v14-dev",        // RESOLVED default branch at build time
   "upstreamSha": "…",                 // exact commit the bundle was built from
   "generatedAt": "2026-07-03T05:00:00.000Z",
-  "itemCount": 5672, "iconCount": 0,
-  "realIcons": 0, "fallbackIcons": 0, "unresolved": 0, "parseErrors": 0
+  "itemCount": 5672, "effectCount": 690, "iconCount": 0,
+  "realIcons": 0, "fallbackIcons": 0, "unresolved": 0, "parseErrors": 0,
+  "refTotal": 8566, "refResolved": 2208,  // outbound links; those into shipped packs resolved to id
+  "danglingRefs": 0, "ambiguousNames": 0  // health signals — both expected to be 0
 }
 ```
 
@@ -73,18 +128,19 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
   so it gets the repo's *default* branch — which pf2e keeps pointed at the current dev branch
   (`v14-dev` → `v15-dev` → …). Major-version bumps are picked up automatically; `meta.json`
   records the resolved branch + commit SHA.
-- **Sparse + shallow checkout** of just `packs/pf2e/equipment` and `static/icons` (git-native,
-  no API rate limits, no HTTP client).
+- **Sparse + shallow checkout** of just `packs/pf2e/equipment`, `packs/pf2e/equipment-effects`
+  and `static/icons` (git-native, no API rate limits, no HTTP client). equipment-effects is
+  optional: if absent, the build still succeeds and effect links simply stay unresolved.
 - **Icons** are deduped by SHA-256 of their bytes and copied as-is (no re-encoding).
   `systems/pf2e/icons/…` resolves to `static/icons/…`; bare `icons/…` (Foundry core art absent
   from this repo) falls back to `static/icons/default-icons/<type>.{webp,svg}` — see the icon
   note above.
 - **Prices** are normalized to total copper + a display string (`1 pp = 10 gp = 100 sp = 1000 cp`).
-- **Descriptions** are cleaned: action-glyph spans become `(1 action)` etc., common Foundry
-  enrichers (`@UUID/@Check/@Damage`, inline `[[/r …]]` rolls) are resolved to their label or a
-  readable phrase, and the result is run through `sanitize-html` to a safe tag subset. This is
-  **best-effort**, not a full Foundry enricher — unusual enrichers may be dropped rather than
-  fully rendered.
+- **Descriptions** are cleaned: action-glyph spans become `(1 action)` etc., `@Check/@Damage` and
+  inline `[[/r …]]` rolls are resolved to a readable phrase, and `@UUID[…]` links become
+  `<a class="ref">` anchors + a structured `references[]` array (see **References** above). The
+  result is run through `sanitize-html` to a safe tag subset. This is **best-effort**, not a full
+  Foundry enricher — unusual enrichers may be dropped rather than fully rendered.
 
 ## Run it locally
 
@@ -93,7 +149,7 @@ npm install
 
 # Point at any local pf2e checkout (sparse is fine):
 git clone --depth 1 --filter=blob:none --sparse https://github.com/foundryvtt/pf2e pf2e-src
-git -C pf2e-src sparse-checkout set packs/pf2e/equipment static/icons
+git -C pf2e-src sparse-checkout set packs/pf2e/equipment packs/pf2e/equipment-effects static/icons
 
 PF2E_SRC=./pf2e-src npm run ingest   # writes ./dist
 ```

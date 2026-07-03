@@ -1,19 +1,24 @@
 /**
  * treasureboard-data ingest
  * -------------------------
- * Transforms the Foundry VTT PF2e "equipment" pack into a slim, self-contained search
- * bundle. This is the ONLY place that knows anything about the pf2e data shape.
+ * Transforms the Foundry VTT PF2e "equipment" (and closely-related "equipment-effects") packs
+ * into a slim, self-contained search bundle. This is the ONLY place that knows anything about the
+ * pf2e data shape.
  *
  * Input  (a local sparse checkout of foundryvtt/pf2e, path from PF2E_SRC):
- *   <PF2E_SRC>/packs/pf2e/equipment/*.json   — one flat Foundry document per item
- *   <PF2E_SRC>/static/icons/**               — the icon files those documents reference
+ *   <PF2E_SRC>/packs/pf2e/equipment/*.json         — one flat Foundry document per item
+ *   <PF2E_SRC>/packs/pf2e/equipment-effects/*.json — the "Effect: …" docs equipment activates
+ *   <PF2E_SRC>/static/icons/**                     — the icon files those documents reference
  *
  * Output (written to OUT_DIR, default ./dist):
  *   equipment.json   — array of slim EquipmentRecord, sorted by id (stable)
+ *   effects.json     — array of slim EffectRecord (equipment-effects), sorted by id (stable)
  *   icons/<hash><ext> — every referenced icon, deduped by content hash
  *   meta.json        — provenance: upstream repo/branch/sha, counts, generatedAt
  *
- * The consuming app never sees pf2e; it only downloads this bundle and serves it.
+ * Equipment and effects cross-reference each other by name; those links are resolved to
+ * bundle-local ids (see cleanDescription / References). The consuming app never sees pf2e; it
+ * only downloads this bundle and serves it.
  */
 
 import { createHash } from "node:crypto";
@@ -31,6 +36,7 @@ const UPSTREAM_BRANCH = process.env.UPSTREAM_BRANCH ?? "(unknown)";
 const UPSTREAM_SHA = process.env.UPSTREAM_SHA ?? "(unknown)";
 
 const EQUIPMENT_DIR = path.join(PF2E_SRC, "packs", "pf2e", "equipment");
+const EQUIPMENT_EFFECTS_DIR = path.join(PF2E_SRC, "packs", "pf2e", "equipment-effects");
 // pf2e stores its own icons under static/; an `img` of `systems/pf2e/icons/x` resolves to
 // `static/icons/x`. NOTE: ~half of equipment items instead point at bare `icons/<foundry-core>`
 // paths (icons/weapons, icons/commodities, …) which are Foundry VTT *core* art — NOT in this
@@ -39,7 +45,7 @@ const STATIC_DIR = path.join(PF2E_SRC, "static");
 const DEFAULT_ICONS_DIR = path.join(STATIC_DIR, "icons", "default-icons");
 const ICONS_OUT_DIR = path.join(OUT_DIR, "icons");
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2; // v2: per-record `references[]` + <a class="ref"> anchors; effects.json
 
 // PF2e coin denominations expressed in copper (the smallest unit).
 const COPPER_PER: Record<string, number> = { pp: 1000, gp: 100, sp: 10, cp: 1 };
@@ -62,6 +68,21 @@ interface Price {
   text: string;
 }
 
+/**
+ * A cross-item link parsed out of a description's Foundry `@UUID[...]` enricher.
+ * `kind` is a normalized category (equipment/spell/condition/effect/action/feat/…).
+ * `id` + `resolved:true` appear ONLY for links that point at a document shipped in this same
+ * bundle — i.e. `kind:"equipment"` (into equipment.json) or `kind:"effect"` (into effects.json).
+ * Everything else lives in a pack we don't ingest, so it is surfaced by `{kind,name}` with
+ * `resolved:false`. See README "References".
+ */
+interface Reference {
+  kind: string;
+  name: string;
+  id?: string;
+  resolved: boolean;
+}
+
 interface EquipmentRecord {
   id: string;
   name: string;
@@ -77,9 +98,38 @@ interface EquipmentRecord {
   baseItem: string | null;
   /** Filename within the bundle's icons/ dir, e.g. "ab12…f.webp"; null if unresolved. */
   img: string | null;
+  /** Deduped outbound links from the description; see Reference. */
+  references: Reference[];
 }
 
-// Shape of the bits we read from a raw Foundry equipment document. Everything is optional
+/** How long an effect lasts. `value` is in `unit`s (-1 / "unlimited" = indefinite). */
+interface Duration {
+  value: number;
+  unit: string;
+  sustained: boolean;
+}
+
+/**
+ * A slim "Effect: …" document from the equipment-effects pack — the rules a piece of equipment
+ * applies when activated. Shares equipment's common fields but carries a duration instead of a
+ * price. Equipment links to these (kind "effect"); their own descriptions link back to equipment.
+ */
+interface EffectRecord {
+  id: string;
+  name: string;
+  type: string;
+  level: number;
+  description: string;
+  rarity: string;
+  traits: string[];
+  duration: Duration | null;
+  publicationTitle: string | null;
+  remaster: boolean;
+  img: string | null;
+  references: Reference[];
+}
+
+// Shape of the bits we read from a raw Foundry equipment/effect document. Everything is optional
 // because upstream is a moving dev branch and we default defensively.
 interface RawDoc {
   _id?: string;
@@ -92,6 +142,7 @@ interface RawDoc {
     baseItem?: string | null;
     description?: { value?: string };
     price?: RawPrice;
+    duration?: { value?: number; unit?: string; sustained?: boolean };
     publication?: { title?: string; remaster?: boolean };
     traits?: { rarity?: string; value?: string[] };
   };
@@ -121,6 +172,17 @@ function normalizePrice(raw: RawPrice | undefined): Price {
   return { copper, per, text };
 }
 
+function normalizeDuration(
+  raw: { value?: number; unit?: string; sustained?: boolean } | undefined,
+): Duration | null {
+  if (!raw || raw.unit == null) return null;
+  return {
+    value: typeof raw.value === "number" ? raw.value : 0,
+    unit: raw.unit,
+    sustained: Boolean(raw.sustained),
+  };
+}
+
 /** Absolute path under static/ for a literal Foundry `img`, or null if the path is unusable. */
 function explicitIconPath(img: string | undefined): string | null {
   if (!img) return null;
@@ -145,15 +207,89 @@ function iconCandidates(img: string | undefined, type: string): string[] {
   return candidates;
 }
 
+// Name<->id index for ONE ingested source (its docs), so descriptions can resolve links into it.
+// Built in pass 1 (once every doc's name/id is known) before any description is cleaned.
+interface SourceIndex {
+  nameToId: Map<string, string>; // doc name -> its Foundry _id (unique within the source)
+  idToName: Map<string, string>; // _id -> name (for the rare id-form reference)
+  ambiguous: Set<string>; // names shared by >1 doc — never auto-resolved
+}
+// One index per ingested source, keyed by the source's resolver key ("equipment" | "effect").
+interface RefResolver {
+  byKind: Map<string, SourceIndex>;
+}
+function indexFor(resolver: RefResolver, key: string): SourceIndex {
+  let idx = resolver.byKind.get(key);
+  if (!idx) {
+    idx = { nameToId: new Map(), idToName: new Map(), ambiguous: new Set() };
+    resolver.byKind.set(key, idx);
+  }
+  return idx;
+}
+
+// Compendium pack id -> the resolver key of the local source that ingests it. ONLY packs we
+// actually bundle appear here; a reference into any other pack is surfaced but left unresolved
+// (and never counted as dangling). The resolver key equals the reference `kind` for our sources.
+// Note equipment-effects resolves but its sibling *-effects packs (spell-effects, …) do NOT — they
+// share the "effect" kind for display yet live outside the bundle.
+const PACK_SOURCE: Record<string, string> = {
+  "equipment-srd": "equipment", equipment: "equipment",
+  "equipment-effects": "effect",
+};
+
+// Foundry pack id -> a stable, normalized reference kind the consumer can switch on. Packs not
+// listed fall through packToKind()'s heuristics. equipment-srd is the compendium id of the very
+// pack we ingest (whose on-disk folder is `equipment`), so both map to "equipment".
+const PACK_KIND: Record<string, string> = {
+  "equipment-srd": "equipment", equipment: "equipment",
+  "spells-srd": "spell",
+  conditionitems: "condition",
+  "equipment-effects": "effect", "spell-effects": "effect", "other-effects": "effect",
+  "bestiary-effects": "effect", "feat-effects": "effect", "campaign-effects": "effect",
+  actionspf2e: "action",
+  "feats-srd": "feat", classfeatures: "feat", ancestryfeatures: "feat",
+  deities: "deity",
+  journals: "journal",
+  "rollable-tables": "table",
+  vehicles: "vehicle",
+  "familiar-abilities": "familiar-ability",
+  "bestiary-ability-glossary-srd": "creature-ability",
+};
+function packToKind(pack: string): string {
+  if (PACK_KIND[pack]) return PACK_KIND[pack];
+  if (/bestiar|monster/i.test(pack)) return "creature";
+  return "other";
+}
+
+/** Escape a string for safe interpolation into HTML text or a double-quoted attribute. */
+function esc(s: string): string {
+  return s
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+const FOUNDRY_ID = /^[A-Za-z0-9]{16}$/;
+
 /**
  * Turn Foundry-flavoured HTML (with @UUID/@Check/@Damage enrichers, inline rolls and
- * action-glyph spans) into clean, safe, human-readable HTML. Best-effort: we resolve the
- * common enrichers to their display label / a readable phrase and drop the rest, then run
- * sanitize-html to keep only a safe tag subset. Not a full Foundry enricher — see README.
+ * action-glyph spans) into clean, safe, human-readable HTML, AND collect the cross-item links.
+ *
+ * Every `@UUID[...]` (labelled or not) becomes a consistent `<a class="ref">` anchor whose text
+ * is the display name and whose `data-kind` + (`data-id` | `data-name`) let a consumer render a
+ * real link — while the same links are also returned as a deduped structured list so consumers
+ * don't have to parse HTML. Links into a pack we bundle (equipment, equipment-effects) are
+ * resolved to their bundle-local id; links into packs we don't ingest carry `data-name` only.
+ * Other enrichers (@Check/@Damage, inline rolls, action glyphs) are still flattened to text.
+ * `dangling` counts links that pointed at a bundled pack yet failed to resolve (expected 0).
+ * Best-effort — see README.
  */
-function cleanDescription(html: string | undefined): string {
-  if (!html) return "";
+function cleanDescription(
+  html: string | undefined,
+  resolver: RefResolver,
+): { html: string; references: Reference[]; dangling: number } {
+  if (!html) return { html: "", references: [], dangling: 0 };
   let out = html;
+  const refs: Reference[] = [];
+  let dangling = 0;
 
   // Action-glyph spans -> readable text. Letters/digits map to the action economy.
   const GLYPH: Record<string, string> = {
@@ -167,7 +303,56 @@ function cleanDescription(html: string | undefined): string {
     (_m, ch: string) => GLYPH[ch.toLowerCase()] ?? "",
   );
 
-  // Any labelled enricher `@Foo[...]{Label}` -> its label (covers most UUID/Damage/Check refs).
+  // @UUID[...] (labelled or not) -> a structured, consistent <a class="ref"> anchor + a Reference.
+  // Handled BEFORE the generic labelled-enricher flatten below so labelled UUIDs keep their target.
+  out = out.replace(
+    /@UUID\[([^\]]*)\](?:\{([^}]*)\})?/g,
+    (_m, body: string, label: string | undefined) => {
+      const parts = body.split(".");
+      // Only Compendium.<scope>.<pack>.<DocType>.<target…> carries a pack + resolvable target.
+      if (parts[0] !== "Compendium" || parts.length < 5) {
+        return (label ?? parts[parts.length - 1] ?? "").trim(); // world/relative ref -> plain text
+      }
+      const pack = parts[2];
+      const target = parts.slice(4).join("."); // a doc name, or (rarely) a 16-char Foundry id
+      const kind = packToKind(pack);
+      const byId = FOUNDRY_ID.test(target);
+
+      // Resolve links into a pack we bundle (equipment, equipment-effects) to a bundle-local id;
+      // leave links into un-ingested packs external. `idx` is defined iff we ingest `pack`, so a
+      // miss there is a genuine dangling link — whereas a miss with no `idx` is simply external.
+      const srcKey = PACK_SOURCE[pack];
+      const idx = srcKey ? resolver.byKind.get(srcKey) : undefined;
+      let id: string | undefined;
+      let resolved = false;
+      let name = (label ?? (byId ? "" : target)).trim();
+      if (idx) {
+        if (byId) {
+          if (idx.idToName.has(target)) {
+            id = target;
+            resolved = true;
+            if (!name) name = idx.idToName.get(target)!;
+          }
+        } else if (!idx.ambiguous.has(target)) {
+          const rid = idx.nameToId.get(target);
+          if (rid) {
+            id = rid;
+            resolved = true;
+          }
+        }
+        if (!resolved) dangling++;
+      }
+      if (!name) name = target; // last-resort display fallback (e.g. unresolved id-form ref)
+
+      refs.push({ kind, name, ...(id ? { id } : {}), resolved });
+      const attrs = id
+        ? `data-kind="${kind}" data-id="${esc(id)}"`
+        : `data-kind="${esc(kind)}" data-name="${esc(name)}"`;
+      return `<a class="ref" ${attrs}>${esc(name || "link")}</a>`;
+    },
+  );
+
+  // Any remaining labelled enricher `@Foo[...]{Label}` -> its label (@Damage/@Check/etc.).
   out = out.replace(/@\w+\[[^\]]*\]\{([^}]*)\}/g, "$1");
 
   // Unlabelled @Check[type:reflex|dc:20|...] -> "reflex check".
@@ -192,12 +377,22 @@ function cleanDescription(html: string | undefined): string {
     allowedTags: [
       "p", "br", "hr", "strong", "b", "em", "i", "u", "s", "sup", "sub",
       "ul", "ol", "li", "table", "thead", "tbody", "tr", "td", "th",
-      "h1", "h2", "h3", "h4", "blockquote", "span",
+      "h1", "h2", "h3", "h4", "blockquote", "span", "a",
     ],
-    allowedAttributes: {}, // strip everything (classes, styles, data-*)
+    // Keep only our reference anchor's attributes; strip everything else (styles, data-*, href…).
+    allowedAttributes: { a: ["class", "data-kind", "data-id", "data-name"] },
   });
 
-  return out.replace(/\s+/g, " ").trim();
+  // Dedup references by kind + (id || name), preserving first-seen order.
+  const seen = new Set<string>();
+  const references = refs.filter((r) => {
+    const key = `${r.kind} ${r.id ?? r.name}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return { html: out.replace(/\s+/g, " ").trim(), references, dangling };
 }
 
 // ---------------------------------------------------------------------------
@@ -208,35 +403,70 @@ async function main(): Promise<void> {
   await rm(OUT_DIR, { recursive: true, force: true });
   await mkdir(ICONS_OUT_DIR, { recursive: true });
 
-  const files = (await readdir(EQUIPMENT_DIR)).filter((f) => f.endsWith(".json")).sort();
-  if (files.length === 0) {
-    throw new Error(`No .json files found in ${EQUIPMENT_DIR}. Is PF2E_SRC a pf2e checkout?`);
-  }
+  // The packs we ingest, in output order. `key` is both the resolver key and the reference kind;
+  // `required` sources hard-fail if absent, optional ones are skipped with a warning (so a local
+  // checkout that didn't sparse-fetch equipment-effects still builds — its links stay external).
+  const SOURCES = [
+    { dir: EQUIPMENT_DIR, key: "equipment", required: true },
+    { dir: EQUIPMENT_EFFECTS_DIR, key: "effect", required: false },
+  ] as const;
 
-  const records: EquipmentRecord[] = [];
   const writtenIcons = new Set<string>(); // hash+ext filenames already copied
   let parseErrors = 0;
-  let realIcons = 0; // items that got their bespoke pf2e icon
-  let fallbackIcons = 0; // items that fell back to a default-icon glyph
-  let unresolved = 0; // items with no icon at all (should be ~0)
+  let realIcons = 0; // docs that got their bespoke pf2e icon
+  let fallbackIcons = 0; // docs that fell back to a default-icon glyph
+  let unresolved = 0; // docs with no icon at all (should be ~0)
 
-  for (const file of files) {
-    const full = path.join(EQUIPMENT_DIR, file);
-    let doc: RawDoc;
+  // --- Pass 1: parse every valid doc and index name<->id per source, so descriptions can resolve
+  // references (which target docs BY NAME) to a bundle-local id — including the two directions of
+  // the equipment<->effect link. ---
+  const docs: { key: string; file: string; doc: RawDoc }[] = [];
+  const resolver: RefResolver = { byKind: new Map() };
+  for (const src of SOURCES) {
+    let files: string[];
     try {
-      doc = JSON.parse(await readFile(full, "utf8")) as RawDoc;
+      files = (await readdir(src.dir)).filter((f) => f.endsWith(".json")).sort();
     } catch {
-      parseErrors++;
-      console.warn(`! skip (bad JSON): ${file}`);
+      if (src.required) {
+        throw new Error(`Cannot read ${src.dir}. Is PF2E_SRC a pf2e checkout?`);
+      }
+      console.warn(`· optional source absent, skipping: ${src.dir}`);
       continue;
     }
-    if (!doc._id || !doc.name) {
-      parseErrors++;
-      console.warn(`! skip (missing _id/name): ${file}`);
+    if (files.length === 0) {
+      if (src.required) throw new Error(`No .json files in ${src.dir}. Is PF2E_SRC a pf2e checkout?`);
       continue;
     }
+    const idx = indexFor(resolver, src.key);
+    for (const file of files) {
+      let doc: RawDoc;
+      try {
+        doc = JSON.parse(await readFile(path.join(src.dir, file), "utf8")) as RawDoc;
+      } catch {
+        parseErrors++;
+        console.warn(`! skip (bad JSON): ${file}`);
+        continue;
+      }
+      if (!doc._id || !doc.name) {
+        parseErrors++;
+        console.warn(`! skip (missing _id/name): ${file}`);
+        continue;
+      }
+      docs.push({ key: src.key, file, doc });
+      idx.idToName.set(doc._id, doc.name);
+      // Names are unique within each source in practice; if two ever collide, refuse to
+      // auto-resolve that name (we can't know which doc was meant) and record it as ambiguous.
+      if (idx.nameToId.has(doc.name)) idx.ambiguous.add(doc.name);
+      else idx.nameToId.set(doc.name, doc._id);
+    }
+  }
 
-    const type = doc.type ?? "equipment";
+  // --- Pass 2: resolve icons, clean descriptions (+ collect references), build records. ---
+  const records: EquipmentRecord[] = [];
+  const effects: EffectRecord[] = [];
+  let danglingRefs = 0;
+  for (const { key, file, doc } of docs) {
+    const type = doc.type ?? (key === "effect" ? "effect" : "equipment");
 
     // Resolve + dedup the icon: real pf2e art if present, else a type default-icon.
     let imgName: string | null = null;
@@ -266,26 +496,56 @@ async function main(): Promise<void> {
     }
 
     const sys = doc.system ?? {};
-    records.push({
-      id: doc._id,
-      name: doc.name,
+    const cleaned = cleanDescription(sys.description?.value, resolver);
+    danglingRefs += cleaned.dangling;
+
+    // Common fields shared by both record shapes.
+    const common = {
+      id: doc._id!,
+      name: doc.name!,
       type,
       level: sys.level?.value ?? 0,
-      description: cleanDescription(sys.description?.value),
+      description: cleaned.html,
       rarity: sys.traits?.rarity ?? "common",
-      price: normalizePrice(sys.price),
       traits: sys.traits?.value ?? [],
-      quantity: sys.quantity ?? 1,
       publicationTitle: sys.publication?.title ?? null,
       remaster: sys.publication?.remaster ?? false,
-      baseItem: sys.baseItem ?? null,
       img: imgName,
-    });
+      references: cleaned.references,
+    };
+
+    if (key === "effect") {
+      effects.push({ ...common, duration: normalizeDuration(sys.duration) });
+    } else {
+      records.push({
+        ...common,
+        price: normalizePrice(sys.price),
+        quantity: sys.quantity ?? 1,
+        baseItem: sys.baseItem ?? null,
+      });
+    }
   }
 
-  records.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const byId = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  records.sort(byId);
+  effects.sort(byId);
+
+  // Reference tallies for provenance: how many links we surfaced and how many resolved in-bundle.
+  // `danglingRefs` (a health signal, expected 0) is accumulated above from links that pointed at
+  // a bundled pack yet missed. `ambiguousNames` sums the never-resolved colliding names per source.
+  let refTotal = 0;
+  let refResolved = 0;
+  for (const r of [...records, ...effects]) {
+    for (const ref of r.references) {
+      refTotal++;
+      if (ref.resolved) refResolved++;
+    }
+  }
+  let ambiguousNames = 0;
+  for (const idx of resolver.byKind.values()) ambiguousNames += idx.ambiguous.size;
 
   await writeFile(path.join(OUT_DIR, "equipment.json"), JSON.stringify(records));
+  await writeFile(path.join(OUT_DIR, "effects.json"), JSON.stringify(effects));
 
   const meta = {
     schemaVersion: SCHEMA_VERSION,
@@ -294,18 +554,25 @@ async function main(): Promise<void> {
     upstreamSha: UPSTREAM_SHA,
     generatedAt: new Date().toISOString(),
     itemCount: records.length,
+    effectCount: effects.length,
     iconCount: writtenIcons.size,
     realIcons,
     fallbackIcons,
     unresolved,
     parseErrors,
+    refTotal,
+    refResolved,
+    danglingRefs,
+    ambiguousNames,
   };
   await writeFile(path.join(OUT_DIR, "meta.json"), JSON.stringify(meta, null, 2));
 
   console.log(
-    `\n✓ ${records.length} items, ${writtenIcons.size} unique icons ` +
+    `\n✓ ${records.length} items + ${effects.length} effects, ${writtenIcons.size} unique icons ` +
       `(${realIcons} bespoke, ${fallbackIcons} type-fallback, ${unresolved} unresolved, ` +
-      `${parseErrors} skipped) from ${UPSTREAM_REPO}@${UPSTREAM_SHA.slice(0, 8)}`,
+      `${parseErrors} skipped) from ${UPSTREAM_REPO}@${UPSTREAM_SHA.slice(0, 8)}\n` +
+      `  ${refTotal} references (${refResolved} resolved in-bundle, ${danglingRefs} dangling` +
+      `${ambiguousNames ? `, ${ambiguousNames} ambiguous names` : ""})`,
   );
 }
 
