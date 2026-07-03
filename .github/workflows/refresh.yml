@@ -21,12 +21,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Sparse + shallow checkout of pf2e. No `ref:` => the repo's DEFAULT branch, which pf2e
       # keeps pointed at the current dev branch (v14-dev, then v15-dev, …). Auto-follows bumps.
       - name: Checkout pf2e (default branch, sparse)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: foundryvtt/pf2e
           path: pf2e-src
@@ -42,7 +42,7 @@ jobs:
           echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
 
@@ -84,7 +84,7 @@ jobs:
 
       - name: Publish data-latest release
         if: steps.check.outputs.changed == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: data-latest
           name: PF2e equipment data (latest)
