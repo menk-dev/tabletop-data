@@ -42,6 +42,10 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
   "publicationTitle": "Pathfinder GM Core",
   "remaster": true,
   "baseItem": "alchemical-bomb",
+  "bulk": { "value": 0.1, "text": "L" }, // pf2e Bulk + display ("—" negligible / "L" light / "3"); null only if absent
+  "usage": "held in one hand",        // humanized wear/hold/affix slug; null if unset
+  "material": null,                   // { "type": "cold-iron", "grade": "standard" } when a precious material, else null
+  "stats": { … },                     // type-specific mechanical block; null for types without one (see Stats)
   "img": "ab12…f.webp",               // filename inside icons/ (.webp or .svg); null only if nothing resolved
   "references": [                     // deduped outbound links parsed from the description
     { "kind": "equipment", "name": "Crowbar (Levered)", "id": "4kz3…", "resolved": true },
@@ -49,6 +53,48 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
   ]
 }
 ```
+
+### Stats
+
+The mechanical numbers a player uses to judge an item — damage, AC, penalties, runes — live in a
+per-record `stats` object whose **shape is keyed by `type`**. It is present only for the four
+combat-relevant types; every other type (`treasure`, `backpack`, `ammo`, generic worn `equipment`,
+`kit`) carries `"stats": null`. Switch on the record's `type` to know which shape to read:
+
+```jsonc
+// type: "weapon"
+"stats": {
+  "damage": { "dice": 1, "die": "d8", "damageType": "piercing", "text": "1d8 piercing" }, // null if none
+  "category": "martial",              // simple | martial | advanced
+  "group": "bow",                     // crit-specialization group; null if unset
+  "range": 100,                       // range increment in feet; null for melee-only
+  "reload": "0",                      // actions to reload; null when not applicable
+  "runes": { "potency": 1, "striking": 1, "property": ["shifting"] } // null when mundane
+}
+// type: "armor"
+"stats": {
+  "acBonus": 6, "dexCap": 0, "checkPenalty": -3, "speedPenalty": -10,
+  "strength": 4,                      // Str score that removes the check penalty; null if unset
+  "category": "heavy",                // unarmored | light | medium | heavy
+  "group": "plate",                   // null if unset
+  "runes": { "potency": 2, "resilient": 1, "property": ["fortification"] } // null when mundane
+}
+// type: "shield"
+"stats": {
+  "acBonus": 2, "hardness": 9, "hp": { "max": 54 }, "speedPenalty": 0,
+  "runes": { "reinforcing": 0 }       // null when mundane
+}
+// type: "consumable"
+"stats": {
+  "category": "wand",                 // potion | scroll | wand | elixir | poison | bomb | …
+  "uses": { "max": 500, "autoDestroy": true }, // multi-charge items only; null when single-use
+  "damage": { "formula": "3d6", "damageType": "acid", "text": "3d6 acid" } // bombs; null otherwise
+}
+```
+
+> **Wands & scrolls** carry the spell they cast as an embedded document rather than a `@UUID` link,
+> so it is surfaced in `references[]` as an external `{ "kind": "spell", "name": …, "resolved": false }`
+> (deduped against any spell the description already links).
 
 ### References
 
@@ -75,8 +121,9 @@ outside the bundle. `meta.json` reports `refTotal` / `refResolved` and, as a hea
 
 ### `effects.json` record
 
-Same common fields as an item, minus `price`/`quantity`/`baseItem`, plus a `duration`. These are
-the rules an item applies when activated; equipment references them by `kind:"effect"`.
+Same common fields as an item, minus the physical/economic ones
+(`price`/`quantity`/`baseItem`/`bulk`/`usage`/`material`/`stats`), plus a `duration`. These are the
+rules an item applies when activated; equipment references them by `kind:"effect"`.
 
 ```jsonc
 {
@@ -110,7 +157,7 @@ the rules an item applies when activated; equipment references them by `kind:"ef
 
 ```jsonc
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "upstreamRepo": "foundryvtt/pf2e",
   "upstreamBranch": "v14-dev",        // RESOLVED default branch at build time
   "upstreamSha": "…",                 // exact commit the bundle was built from

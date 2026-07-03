@@ -45,7 +45,9 @@ const STATIC_DIR = path.join(PF2E_SRC, "static");
 const DEFAULT_ICONS_DIR = path.join(STATIC_DIR, "icons", "default-icons");
 const ICONS_OUT_DIR = path.join(OUT_DIR, "icons");
 
-const SCHEMA_VERSION = 2; // v2: per-record `references[]` + <a class="ref"> anchors; effects.json
+// v3: per-record mechanical `stats` block (weapon/armor/shield/consumable) + common bulk/usage/
+// material; embedded consumable spells surfaced as `kind:"spell"` references.
+const SCHEMA_VERSION = 3;
 
 // PF2e coin denominations expressed in copper (the smallest unit).
 const COPPER_PER: Record<string, number> = { pp: 1000, gp: 100, sp: 10, cp: 1 };
@@ -83,6 +85,93 @@ interface Reference {
   resolved: boolean;
 }
 
+/** Encumbrance. `value` is pf2e Bulk (0 = negligible, <1 = Light); `text` renders it ("—"/"L"/"3"). */
+interface Bulk {
+  value: number;
+  text: string;
+}
+
+/** A precious material and its grade (e.g. cold iron / standard). null when the item is mundane. */
+interface Material {
+  type: string; // adamantine, cold-iron, silver, dawnsilver, …
+  grade: string | null; // low | standard | high
+}
+
+/** A dice-pool damage expression, pre-rendered to a display string (e.g. "1d8 piercing"). */
+interface WeaponDamage {
+  dice: number;
+  die: string; // "d4".."d12"
+  damageType: string;
+  text: string;
+}
+
+/** A consumable's fixed damage (bombs), which pf2e stores as a formula string, not a dice pool. */
+interface ConsumableDamage {
+  formula: string; // "3d6"
+  damageType: string;
+  text: string; // "3d6 acid"
+}
+
+/** Magic runes etched onto a weapon. null when the item carries none. */
+interface WeaponRunes {
+  potency: number; // +1..+3 to hit
+  striking: number; // 1..3 = striking / greater / major (extra damage dice)
+  property: string[]; // named property runes, e.g. ["flaming"]
+}
+
+/** Magic runes etched onto armor. null when the item carries none. */
+interface ArmorRunes {
+  potency: number; // +1..+3 to AC
+  resilient: number; // 1..3 = resilient / greater / major (bonus to saves)
+  property: string[];
+}
+
+/** Magic runes etched onto a shield. null when the item carries none. */
+interface ShieldRunes {
+  reinforcing: number; // tier of reinforcing rune (raises shield Hardness/HP)
+}
+
+interface WeaponStats {
+  damage: WeaponDamage | null;
+  category: string; // simple | martial | advanced
+  group: string | null; // bow, sword, … (drives critical specialization)
+  range: number | null; // range increment in feet; null for melee-only
+  reload: string | null; // actions to reload; null when not applicable
+  runes: WeaponRunes | null;
+}
+
+interface ArmorStats {
+  acBonus: number;
+  dexCap: number;
+  checkPenalty: number;
+  speedPenalty: number;
+  strength: number | null; // Strength score to ignore the check penalty; null if unset
+  category: string; // light | medium | heavy | unarmored
+  group: string | null; // leather, plate, …
+  runes: ArmorRunes | null;
+}
+
+interface ShieldStats {
+  acBonus: number;
+  hardness: number; // absorbs this much damage when raised
+  hp: { max: number }; // shield breaks at 0 / is destroyed at half
+  speedPenalty: number;
+  runes: ShieldRunes | null;
+}
+
+interface ConsumableStats {
+  category: string; // potion | scroll | wand | elixir | poison | bomb | …
+  uses: { max: number; autoDestroy: boolean } | null; // multi-charge items only (null when single-use)
+  damage: ConsumableDamage | null; // bombs; null otherwise
+}
+
+/**
+ * Type-specific mechanical stats — the numbers a player uses to judge an item. Present only for the
+ * four combat-relevant types; the shape is discriminated by the record's `type`. null for every
+ * other type (treasure, backpack, ammo, generic worn equipment, …), which carries no such block.
+ */
+type ItemStats = WeaponStats | ArmorStats | ShieldStats | ConsumableStats;
+
 interface EquipmentRecord {
   id: string;
   name: string;
@@ -96,6 +185,14 @@ interface EquipmentRecord {
   publicationTitle: string | null;
   remaster: boolean;
   baseItem: string | null;
+  /** pf2e Bulk. null only if the field is absent (defensive; equipment always carries it). */
+  bulk: Bulk | null;
+  /** How the item is worn/held/affixed, humanized (e.g. "held in one hand", "etched onto weapon"). */
+  usage: string | null;
+  /** Precious material + grade, or null when mundane. */
+  material: Material | null;
+  /** Mechanical stat block, shape keyed by `type`; null for types without one. See ItemStats. */
+  stats: ItemStats | null;
   /** Filename within the bundle's icons/ dir, e.g. "ab12…f.webp"; null if unresolved. */
   img: string | null;
   /** Deduped outbound links from the description; see Reference. */
@@ -145,6 +242,34 @@ interface RawDoc {
     duration?: { value?: number; unit?: string; sustained?: boolean };
     publication?: { title?: string; remaster?: boolean };
     traits?: { rarity?: string; value?: string[] };
+    // --- v3 mechanical fields (all optional; shapes vary by item type) ---
+    bulk?: { value?: number };
+    usage?: { value?: string };
+    material?: { type?: string | null; grade?: string | null };
+    // weapon
+    damage?: { damageType?: string; dice?: number; die?: string; formula?: string; type?: string };
+    category?: string; // weapon / armor / consumable proficiency-or-kind
+    group?: string | null; // weapon / armor group
+    range?: number | null; // weapon range increment
+    reload?: { value?: string | number };
+    runes?: {
+      potency?: number;
+      striking?: number;
+      resilient?: number;
+      reinforcing?: number;
+      property?: string[];
+    };
+    // armor / shield
+    acBonus?: number;
+    dexCap?: number;
+    checkPenalty?: number;
+    speedPenalty?: number;
+    strength?: number | null;
+    hardness?: number;
+    hp?: { max?: number; value?: number };
+    // consumable
+    uses?: { max?: number; value?: number; autoDestroy?: boolean };
+    spell?: { name?: string } | null;
   };
 }
 
@@ -181,6 +306,146 @@ function normalizeDuration(
     unit: raw.unit,
     sustained: Boolean(raw.sustained),
   };
+}
+
+/** pf2e Bulk -> value + display text ("—" negligible, "L" light, else the number). */
+function normalizeBulk(raw: { value?: number } | undefined): Bulk | null {
+  const value = typeof raw?.value === "number" ? raw.value : null;
+  if (value === null) return null;
+  const text = value === 0 ? "—" : value < 1 ? "L" : String(value);
+  return { value, text };
+}
+
+/** Foundry usage slug -> a humanized phrase ("held-in-one-hand" -> "held in one hand"). */
+function normalizeUsage(raw: { value?: string } | undefined): string | null {
+  let v = raw?.value?.trim();
+  if (!v) return null;
+  // Legacy concatenated slugs like "wornamulet"/"wornbackpack" -> "worn amulet".
+  if (/^worn[a-z]/.test(v)) v = "worn-" + v.slice(4);
+  return v.replace(/-/g, " ");
+}
+
+/** Precious-material block -> {type, grade}, or null when the item is mundane. */
+function normalizeMaterial(
+  raw: { type?: string | null; grade?: string | null } | undefined,
+): Material | null {
+  if (!raw?.type) return null;
+  return { type: raw.type, grade: raw.grade ?? null };
+}
+
+/** Weapon damage {damageType, dice, die} -> pool + "1d8 piercing" text; null if incomplete. */
+function normalizeWeaponDamage(
+  raw: { damageType?: string; dice?: number; die?: string } | undefined,
+): WeaponDamage | null {
+  if (!raw?.die || !raw.damageType) return null;
+  const dice = typeof raw.dice === "number" ? raw.dice : 1;
+  return { dice, die: raw.die, damageType: raw.damageType, text: `${dice}${raw.die} ${raw.damageType}` };
+}
+
+/** Consumable damage {formula, type} (bombs) -> formula + "3d6 acid" text; null if none. */
+function normalizeConsumableDamage(
+  raw: { formula?: string; type?: string } | undefined,
+): ConsumableDamage | null {
+  if (!raw?.formula) return null;
+  const damageType = raw.type ?? "";
+  return {
+    formula: raw.formula,
+    damageType,
+    text: damageType ? `${raw.formula} ${damageType}` : raw.formula,
+  };
+}
+
+/** Actions-to-reload -> string, or null when not applicable ("", "-", or absent). */
+function normalizeReload(raw: { value?: string | number } | undefined): string | null {
+  if (raw?.value == null) return null;
+  const s = String(raw.value).trim();
+  return s === "" || s === "-" ? null : s;
+}
+
+type RawRunes = {
+  potency?: number;
+  striking?: number;
+  resilient?: number;
+  reinforcing?: number;
+  property?: string[];
+} | undefined;
+
+/** Weapon runes -> {potency, striking, property}, or null when the weapon carries none. */
+function weaponRunes(raw: RawRunes): WeaponRunes | null {
+  const potency = raw?.potency ?? 0;
+  const striking = raw?.striking ?? 0;
+  const property = raw?.property ?? [];
+  if (!potency && !striking && property.length === 0) return null;
+  return { potency, striking, property };
+}
+
+/** Armor runes -> {potency, resilient, property}, or null when the armor carries none. */
+function armorRunes(raw: RawRunes): ArmorRunes | null {
+  const potency = raw?.potency ?? 0;
+  const resilient = raw?.resilient ?? 0;
+  const property = raw?.property ?? [];
+  if (!potency && !resilient && property.length === 0) return null;
+  return { potency, resilient, property };
+}
+
+/** Shield runes -> {reinforcing}, or null when the shield carries none. */
+function shieldRunes(raw: RawRunes): ShieldRunes | null {
+  const reinforcing = raw?.reinforcing ?? 0;
+  return reinforcing ? { reinforcing } : null;
+}
+
+/** Multi-charge tracking -> {max, autoDestroy}; null for single-use items (max <= 1). */
+function normalizeUses(
+  raw: { max?: number; autoDestroy?: boolean } | undefined,
+): { max: number; autoDestroy: boolean } | null {
+  if (typeof raw?.max !== "number" || raw.max <= 1) return null;
+  return { max: raw.max, autoDestroy: Boolean(raw.autoDestroy) };
+}
+
+/**
+ * Build the type-specific mechanical stat block a player reads to judge an item. Only weapon,
+ * armor, shield and consumable carry one; every other type returns null. Shape is discriminated by
+ * `type` (see ItemStats) — the consumer switches on the record's `type` to know which shape to read.
+ */
+function buildStats(type: string, sys: NonNullable<RawDoc["system"]>): ItemStats | null {
+  switch (type) {
+    case "weapon":
+      return {
+        damage: normalizeWeaponDamage(sys.damage),
+        category: sys.category ?? "",
+        group: sys.group ?? null,
+        range: typeof sys.range === "number" ? sys.range : null,
+        reload: normalizeReload(sys.reload),
+        runes: weaponRunes(sys.runes),
+      };
+    case "armor":
+      return {
+        acBonus: sys.acBonus ?? 0,
+        dexCap: sys.dexCap ?? 0,
+        checkPenalty: sys.checkPenalty ?? 0,
+        speedPenalty: sys.speedPenalty ?? 0,
+        strength: typeof sys.strength === "number" ? sys.strength : null,
+        category: sys.category ?? "",
+        group: sys.group ?? null,
+        runes: armorRunes(sys.runes),
+      };
+    case "shield":
+      return {
+        acBonus: sys.acBonus ?? 0,
+        hardness: sys.hardness ?? 0,
+        hp: { max: sys.hp?.max ?? 0 },
+        speedPenalty: sys.speedPenalty ?? 0,
+        runes: shieldRunes(sys.runes),
+      };
+    case "consumable":
+      return {
+        category: sys.category ?? "",
+        uses: normalizeUses(sys.uses),
+        damage: normalizeConsumableDamage(sys.damage),
+      };
+    default:
+      return null;
+  }
 }
 
 /** Absolute path under static/ for a literal Foundry `img`, or null if the path is unusable. */
@@ -499,6 +764,16 @@ async function main(): Promise<void> {
     const cleaned = cleanDescription(sys.description?.value, resolver);
     danglingRefs += cleaned.dangling;
 
+    // A wand/scroll carries its spell as an embedded doc rather than a @UUID link; surface it as an
+    // (unresolved, external) spell reference so consumers see what the item casts. Skip if the
+    // description already linked the same spell.
+    if (type === "consumable" && sys.spell?.name) {
+      const spellName = sys.spell.name;
+      if (!cleaned.references.some((r) => r.kind === "spell" && r.name === spellName)) {
+        cleaned.references.push({ kind: "spell", name: spellName, resolved: false });
+      }
+    }
+
     // Common fields shared by both record shapes.
     const common = {
       id: doc._id!,
@@ -522,6 +797,10 @@ async function main(): Promise<void> {
         price: normalizePrice(sys.price),
         quantity: sys.quantity ?? 1,
         baseItem: sys.baseItem ?? null,
+        bulk: normalizeBulk(sys.bulk),
+        usage: normalizeUsage(sys.usage),
+        material: normalizeMaterial(sys.material),
+        stats: buildStats(type, sys),
       });
     }
   }
