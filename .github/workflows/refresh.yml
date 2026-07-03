@@ -1,0 +1,101 @@
+name: Refresh PF2e equipment data
+
+# Rebuilds the slim equipment bundle daily from the CURRENT pf2e dev branch and, only when
+# upstream actually changed, (re)publishes it as the moving `data-latest` release asset.
+on:
+  schedule:
+    - cron: "0 5 * * *" # 05:00 UTC daily
+  workflow_dispatch:
+
+# Needed to publish/update the release.
+permissions:
+  contents: write
+
+# Never let two refreshes race on the same tag.
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      # Sparse + shallow checkout of pf2e. No `ref:` => the repo's DEFAULT branch, which pf2e
+      # keeps pointed at the current dev branch (v14-dev, then v15-dev, …). Auto-follows bumps.
+      - name: Checkout pf2e (default branch, sparse)
+        uses: actions/checkout@v4
+        with:
+          repository: foundryvtt/pf2e
+          path: pf2e-src
+          fetch-depth: 1
+          sparse-checkout: |
+            packs/pf2e/equipment
+            static/icons
+
+      - name: Record upstream ref
+        id: upstream
+        working-directory: pf2e-src
+        run: |
+          echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install deps
+        run: npm install --no-audit --no-fund
+
+      - name: Build bundle
+        run: npx tsx ingest.ts
+        env:
+          PF2E_SRC: ${{ github.workspace }}/pf2e-src
+          OUT_DIR: ${{ github.workspace }}/dist
+          UPSTREAM_REPO: foundryvtt/pf2e
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+
+      # Compare the freshly-built upstreamSha against whatever the current release was built
+      # from. If unchanged, we skip publishing (no-op day).
+      - name: Detect change vs current release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEW_SHA="$(node -p "require('./dist/meta.json').upstreamSha")"
+          CUR_SHA=""
+          if gh release download data-latest --repo "$GITHUB_REPOSITORY" --pattern meta.json --dir current --clobber 2>/dev/null; then
+            CUR_SHA="$(node -p "require('./current/meta.json').upstreamSha" 2>/dev/null || echo '')"
+          fi
+          echo "new_sha=$NEW_SHA"
+          echo "cur_sha=$CUR_SHA"
+          if [ "$NEW_SHA" = "$CUR_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package bundle
+        if: steps.check.outputs.changed == 'true'
+        run: tar -czf treasureboard-data.tar.gz -C dist .
+
+      - name: Publish data-latest release
+        if: steps.check.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: data-latest
+          name: PF2e equipment data (latest)
+          body: |
+            Auto-generated equipment bundle.
+            Upstream: `${{ steps.upstream.outputs.branch }}` @ `${{ steps.upstream.outputs.sha }}`
+          files: |
+            treasureboard-data.tar.gz
+            dist/meta.json
+
+      - name: Summary
+        run: |
+          echo "changed=${{ steps.check.outputs.changed }}" >> "$GITHUB_STEP_SUMMARY"
+          cat dist/meta.json >> "$GITHUB_STEP_SUMMARY"
