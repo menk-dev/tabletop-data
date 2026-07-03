@@ -59,21 +59,25 @@ jobs:
           UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
 
-      # Compare the freshly-built upstreamSha against whatever the current release was built
-      # from. If unchanged, we skip publishing (no-op day).
+      # Compare the freshly-built bundle against whatever the current release holds. We republish
+      # when EITHER the upstream data (upstreamSha) OR our own output format (schemaVersion) changed
+      # — otherwise a schema bump with no upstream change would leave the stale bundle published.
       - name: Detect change vs current release
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           NEW_SHA="$(node -p "require('./dist/meta.json').upstreamSha")"
+          NEW_SCHEMA="$(node -p "require('./dist/meta.json').schemaVersion")"
           CUR_SHA=""
+          CUR_SCHEMA=""
           if gh release download data-latest --repo "$GITHUB_REPOSITORY" --pattern meta.json --dir current --clobber 2>/dev/null; then
             CUR_SHA="$(node -p "require('./current/meta.json').upstreamSha" 2>/dev/null || echo '')"
+            CUR_SCHEMA="$(node -p "require('./current/meta.json').schemaVersion" 2>/dev/null || echo '')"
           fi
-          echo "new_sha=$NEW_SHA"
-          echo "cur_sha=$CUR_SHA"
-          if [ "$NEW_SHA" = "$CUR_SHA" ]; then
+          echo "new_sha=$NEW_SHA schema=$NEW_SCHEMA"
+          echo "cur_sha=$CUR_SHA schema=$CUR_SCHEMA"
+          if [ "$NEW_SHA" = "$CUR_SHA" ] && [ "$NEW_SCHEMA" = "$CUR_SCHEMA" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
