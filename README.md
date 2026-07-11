@@ -77,8 +77,8 @@ revision's trait configuration and English localization:
 ```
 
 `slug` and `label` are always present. `description` and `group` are `null` where PF2e does not
-provide an unambiguous value. Generation fails rather than publishing a referenced trait without a
-localized label.
+provide an unambiguous value. Legacy traits retained by equipment after removal from PF2e's active
+configuration use a deterministic title-cased slug as their label.
 
 ### Stats
 

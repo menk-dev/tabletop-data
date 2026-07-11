@@ -21,7 +21,7 @@ test("generates schema v4 records and trait metadata", async () => {
     system: { level: { value: 1 }, description: { value: "<p>Structured only.</p>" },
       price: { value: { gp: 1 } }, publication: { title: "Player Core", remaster: true },
       bulk: { value: 0.1 }, usage: { value: "held-in-one-hand", hands: 1 },
-      traits: { rarity: "common", value: ["invested"] } },
+      traits: { rarity: "common", value: ["invested", "chaotic"] } },
   };
   const docs = [
     { ...common, _id: "aaaaaaaaaaaaaaaa", name: "Gear", type: "equipment" },
@@ -67,7 +67,7 @@ const traitDescriptions: Record<string, string> = {
   const meta = JSON.parse(await readFile(path.join(out, "meta.json"), "utf8"));
   const named = (name: string) => records.find((record: { name: string }) => record.name === name);
   assert.equal(meta.schemaVersion, 4);
-  assert.equal(meta.traitCount, 1);
+  assert.equal(meta.traitCount, 2);
   assert.deepEqual({ bulk: named("Gear").bulk, usage: named("Gear").usage, hands: named("Gear").hands },
     { bulk: 0.1, usage: "held-in-one-hand", hands: 1 });
   assert.deepEqual(named("Gear").source, { title: "Player Core", remaster: true });
@@ -78,6 +78,8 @@ const traitDescriptions: Record<string, string> = {
   assert.equal(named("Plate").armor.checkPenalty, -3);
   assert.deepEqual(named("Acid").consumable, { category: "bomb", uses: 1, maxUses: 1,
     effectKind: "damage", formula: "1d6", damageType: "acid" });
-  assert.deepEqual(traits, [{ slug: "invested", label: "Invested",
-    description: "An invested item.", group: "general" }]);
+  assert.deepEqual(traits, [
+    { slug: "chaotic", label: "Chaotic", description: null, group: null },
+    { slug: "invested", label: "Invested", description: "An invested item.", group: "general" },
+  ]);
 });

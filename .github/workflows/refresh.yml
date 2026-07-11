@@ -35,8 +35,8 @@ jobs:
             packs/pf2e/equipment
             packs/pf2e/equipment-effects
             static/icons
-            static/lang/en.json
-            src/scripts/config/traits.ts
+            static/lang
+            src/scripts/config
 
       - name: Record upstream ref
         id: upstream

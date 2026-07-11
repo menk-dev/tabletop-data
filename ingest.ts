@@ -764,6 +764,10 @@ function localizationValue(root: unknown, dottedKey: string): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+function traitLabelFallback(slug: string): string {
+  return slug.split("-").filter(Boolean).map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" ");
+}
+
 function directTraitEntries(source: string, objectName: string): Map<string, string> {
   const declaration = new RegExp(`const ${objectName}(?:\\s*:[^=]+)?\\s*=\\s*\\{`).exec(source);
   if (!declaration) return new Map();
@@ -796,8 +800,10 @@ async function buildTraits(slugs: Set<string>): Promise<TraitRecord[]> {
 
   return [...slugs].sort().map((slug) => {
     const labelKey = allLabels.get(slug);
-    const label = labelKey ? localizationValue(localization, labelKey) : null;
-    if (!label) throw new Error(`No localized label configured for referenced trait: ${slug}`);
+    // The moving PF2e equipment pack can retain legacy alignment traits after their active config
+    // and localization entries are removed (for example `chaotic`). Keep the catalog complete with
+    // a deterministic slug-derived label; descriptions/groups remain null when no source exists.
+    const label = (labelKey ? localizationValue(localization, labelKey) : null) ?? traitLabelFallback(slug);
     const descriptionKey = descriptions.get(slug);
     const memberships = families.filter((family) => familyMaps.get(family)?.has(slug));
     const group = memberships.length === 1
