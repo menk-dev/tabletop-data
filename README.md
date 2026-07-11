@@ -54,6 +54,14 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
     "potency": 0, "striking": 0, "propertyRunes": []
   },
   "stats": { … },                     // type-specific mechanical block; null for types without one (see Stats)
+  "skillBonuses": [                   // FlatModifier rules for the 16 core skills
+    { "skill": "athletics", "amount": 2, "formula": null, "bonusType": "item",
+      "predicate": ["action:climb"] }
+  ],
+  "otherCheckBonuses": [              // Lore, perception, generic, ability, or dynamic checks
+    { "selector": "perception", "category": "perception", "amount": 2,
+      "formula": null, "bonusType": "item", "predicate": null }
+  ],
   "img": "ab12…f.webp",               // filename inside icons/ (.webp or .svg); null only if nothing resolved
   "references": [                     // deduped outbound links parsed from the description
     { "kind": "equipment", "name": "Crowbar (Levered)", "id": "4kz3…", "resolved": true },
@@ -62,7 +70,7 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
 }
 ```
 
-The schema-v4 normalized fields use `null` for absent or inapplicable values. Numeric zero is kept
+The schema-v5 normalized fields use `null` for absent or inapplicable values. Numeric zero is kept
 only when it is a real value (including negligible Bulk, zero bonuses, and mundane rune ranks).
 Only the applicable `weapon`, `armor`, or `consumable` object is emitted. The older `stats` block,
 display price fields, references, and publication fields remain as compatibility data.
@@ -122,6 +130,20 @@ combat-relevant types; every other type (`treasure`, `backpack`, `ammo`, generic
 > so it is surfaced in `references[]` as an external `{ "kind": "spell", "name": …, "resolved": false }`
 > (deduped against any spell the description already links).
 
+### Skill and check bonuses
+
+Every equipment and equipment-effect record has `skillBonuses` and `otherCheckBonuses` arrays,
+extracted from PF2e `FlatModifier` rules. `skillBonuses` contains only the 16 core skills;
+`otherCheckBonuses` classifies supported selectors as `lore`, `perception`, `skill-check`, or
+`dynamic`. Multi-selector rules become one entry per supported selector. Unrelated modifiers such
+as attacks, saves, damage, and AC are not included.
+
+`amount` is a signed number (penalties are negative) when the upstream value is fixed. Dynamic
+values instead carry `amount: null` and preserve the original expression in `formula`. `bonusType`
+preserves types such as `item` or `circumstance`, and `predicate` preserves the PF2e condition
+structure; both are `null` when absent. Activated/temporary modifiers remain on their records in
+`effects.json` and are not copied onto linked equipment.
+
 ### References
 
 Descriptions link other documents via Foundry `@UUID[…]` enrichers. Rather than flatten those to
@@ -161,6 +183,7 @@ rules an item applies when activated; equipment references them by `kind:"effect
   "rarity": "common",
   "traits": [],
   "duration": { "value": 1, "unit": "minutes", "sustained": false }, // null if none; -1 = indefinite
+  "skillBonuses": [], "otherCheckBonuses": [], // same modifier shapes as equipment
   "publicationTitle": "Pathfinder #158: Sixty Feet Under",
   "remaster": false,
   "img": "cd34…f.webp",
@@ -183,7 +206,7 @@ rules an item applies when activated; equipment references them by `kind:"effect
 
 ```jsonc
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "upstreamRepo": "foundryvtt/pf2e",
   "upstreamBranch": "v14-dev",        // RESOLVED default branch at build time
   "upstreamSha": "…",                 // exact commit the bundle was built from

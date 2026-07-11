@@ -47,9 +47,8 @@ const ICONS_OUT_DIR = path.join(OUT_DIR, "icons");
 const TRAITS_CONFIG = path.join(PF2E_SRC, "src", "scripts", "config", "traits.ts");
 const EN_LOCALIZATION = path.join(PF2E_SRC, "static", "lang", "en.json");
 
-// v4: normalized catalog-family blocks and trait metadata; the v3 stats/reference fields remain
-// available as compatibility data.
-const SCHEMA_VERSION = 4;
+// v5: structured skill/check modifiers; prior normalized fields remain compatibility data.
+const SCHEMA_VERSION = 5;
 
 // PF2e coin denominations expressed in copper (the smallest unit).
 const COPPER_PER: Record<string, number> = { pp: 1000, gp: 100, sp: 10, cp: 1 };
@@ -169,6 +168,35 @@ interface ConsumableStats {
  */
 type ItemStats = WeaponStats | ArmorStats | ShieldStats | ConsumableStats;
 
+const CORE_SKILLS = new Set([
+  "acrobatics", "arcana", "athletics", "crafting", "deception", "diplomacy", "intimidation",
+  "medicine", "nature", "occultism", "performance", "religion", "society", "stealth",
+  "survival", "thievery",
+]);
+
+interface ModifierValue {
+  amount: number | null;
+  formula: string | null;
+  bonusType: string | null;
+  predicate: unknown[] | null;
+}
+
+interface SkillBonus extends ModifierValue {
+  skill: string;
+}
+
+type OtherCheckCategory = "lore" | "perception" | "skill-check" | "dynamic";
+
+interface OtherCheckBonus extends ModifierValue {
+  selector: string;
+  category: OtherCheckCategory;
+}
+
+interface CheckBonuses {
+  skillBonuses: SkillBonus[];
+  otherCheckBonuses: OtherCheckBonus[];
+}
+
 interface EquipmentRecord {
   id: string;
   name: string;
@@ -202,6 +230,8 @@ interface EquipmentRecord {
   img: string | null;
   /** Deduped outbound links from the description; see Reference. */
   references: Reference[];
+  skillBonuses: SkillBonus[];
+  otherCheckBonuses: OtherCheckBonus[];
 }
 
 interface CatalogWeapon {
@@ -269,6 +299,8 @@ interface EffectRecord {
   remaster: boolean;
   img: string | null;
   references: Reference[];
+  skillBonuses: SkillBonus[];
+  otherCheckBonuses: OtherCheckBonus[];
 }
 
 // Shape of the bits we read from a raw Foundry equipment/effect document. Everything is optional
@@ -317,6 +349,7 @@ interface RawDoc {
     // consumable
     uses?: { max?: number; value?: number; autoDestroy?: boolean };
     spell?: { name?: string } | null;
+    rules?: unknown;
   };
 }
 
@@ -357,6 +390,48 @@ function normalizeDuration(
 
 function normalizeBulk(raw: { value?: number } | undefined): number | null {
   return typeof raw?.value === "number" ? raw.value : null;
+}
+
+function otherCheckCategory(selector: string): OtherCheckCategory | null {
+  if (selector === "perception") return "perception";
+  if (selector.includes("lore")) return "lore";
+  if (selector === "skill-check" || /^(str|dex|con|int|wis|cha)-skill-check$/.test(selector)) {
+    return "skill-check";
+  }
+  if (/^\{[^}]+\}$/.test(selector) && selector.includes("skill")) return "dynamic";
+  return null;
+}
+
+/** Extract only FlatModifier rules that target core skills or explicitly supported broad checks. */
+function extractCheckBonuses(rules: unknown): CheckBonuses {
+  const skillBonuses: SkillBonus[] = [];
+  const otherCheckBonuses: OtherCheckBonus[] = [];
+  for (const raw of Array.isArray(rules) ? rules : []) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const rule = raw as Record<string, unknown>;
+    if (rule.key !== "FlatModifier") continue;
+    const selectors = Array.isArray(rule.selector) ? rule.selector : [rule.selector];
+    const value = typeof rule.value === "number" || typeof rule.value === "string"
+      ? rule.value
+      : null;
+    if (value === null) continue;
+    const common: ModifierValue = {
+      amount: typeof value === "number" ? value : null,
+      formula: typeof value === "string" ? value : null,
+      bonusType: typeof rule.type === "string" ? rule.type : null,
+      predicate: Array.isArray(rule.predicate) ? rule.predicate : null,
+    };
+    for (const selector of selectors) {
+      if (typeof selector !== "string") continue;
+      if (CORE_SKILLS.has(selector)) {
+        skillBonuses.push({ skill: selector, ...common });
+      } else {
+        const category = otherCheckCategory(selector);
+        if (category) otherCheckBonuses.push({ selector, category, ...common });
+      }
+    }
+  }
+  return { skillBonuses, otherCheckBonuses };
 }
 
 function normalizeUsage(raw: { value?: string } | undefined): string | null {
@@ -920,6 +995,7 @@ async function main(): Promise<void> {
 
     const sys = doc.system ?? {};
     const cleaned = cleanDescription(sys.description?.value, resolver);
+    const checkBonuses = extractCheckBonuses(sys.rules);
     danglingRefs += cleaned.dangling;
 
     // A wand/scroll carries its spell as an embedded doc rather than a @UUID link; surface it as an
@@ -945,6 +1021,7 @@ async function main(): Promise<void> {
       remaster: sys.publication?.remaster ?? false,
       img: imgName,
       references: cleaned.references,
+      ...checkBonuses,
     };
 
     if (key === "effect") {
