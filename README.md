@@ -15,6 +15,7 @@ it to the moving `data-latest` release. The tarball `treasureboard-data.tar.gz` 
 
 ```
 equipment.json     # array of slim item records, sorted by id (stable)
+traits.json        # metadata for every trait referenced by equipment, sorted by slug
 effects.json       # array of slim "Effect: …" records equipment activates, sorted by id
 icons/<hash><ext>  # every referenced icon, deduped by content hash
 meta.json          # provenance + counts (also uploaded as a standalone asset)
@@ -39,12 +40,19 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
   "price": { "copper": 25000, "per": 1, "text": "250 gp" },
   "traits": ["acid", "alchemical", "bomb", "consumable", "splash"],
   "quantity": 1,
-  "publicationTitle": "Pathfinder GM Core",
-  "remaster": true,
+  "source": { "title": "Pathfinder GM Core", "remaster": true },
   "baseItem": "alchemical-bomb",
-  "bulk": { "value": 0.1, "text": "L" }, // pf2e Bulk + display ("—" negligible / "L" light / "3"); null only if absent
-  "usage": "held in one hand",        // humanized wear/hold/affix slug; null if unset
+  "bulk": 0.1,                       // normal Bulk units: 0.1 = light, 0 = negligible
+  "usage": "held-in-one-hand",       // stable PF2e kebab-case slug
+  "hands": 1,
   "material": null,                   // { "type": "cold-iron", "grade": "standard" } when a precious material, else null
+  "size": "med", "hardness": null, "hp": null,
+  "category": "martial", "group": "bomb",
+  "weapon": {                        // only on weapons; armor/consumable use their named block
+    "damageDice": 1, "damageDie": "d6", "damageType": "acid",
+    "range": 20, "reload": null, "canBeAmmo": false, "splashDamage": 3,
+    "potency": 0, "striking": 0, "propertyRunes": []
+  },
   "stats": { … },                     // type-specific mechanical block; null for types without one (see Stats)
   "img": "ab12…f.webp",               // filename inside icons/ (.webp or .svg); null only if nothing resolved
   "references": [                     // deduped outbound links parsed from the description
@@ -53,6 +61,24 @@ https://github.com/<owner>/treasureboard-data/releases/download/data-latest/trea
   ]
 }
 ```
+
+The schema-v4 normalized fields use `null` for absent or inapplicable values. Numeric zero is kept
+only when it is a real value (including negligible Bulk, zero bonuses, and mundane rune ranks).
+Only the applicable `weapon`, `armor`, or `consumable` object is emitted. The older `stats` block,
+display price fields, references, and publication fields remain as compatibility data.
+
+### `traits.json`
+
+Every slug referenced by an equipment record has one metadata record sourced from the same PF2e
+revision's trait configuration and English localization:
+
+```jsonc
+{ "slug": "invested", "label": "Invested", "description": "An item with this trait…", "group": "general" }
+```
+
+`slug` and `label` are always present. `description` and `group` are `null` where PF2e does not
+provide an unambiguous value. Generation fails rather than publishing a referenced trait without a
+localized label.
 
 ### Stats
 
@@ -157,12 +183,12 @@ rules an item applies when activated; equipment references them by `kind:"effect
 
 ```jsonc
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "upstreamRepo": "foundryvtt/pf2e",
   "upstreamBranch": "v14-dev",        // RESOLVED default branch at build time
   "upstreamSha": "…",                 // exact commit the bundle was built from
   "generatedAt": "2026-07-03T05:00:00.000Z",
-  "itemCount": 5672, "effectCount": 690, "iconCount": 0,
+  "itemCount": 5672, "traitCount": 400, "effectCount": 690, "iconCount": 0,
   "realIcons": 0, "fallbackIcons": 0, "unresolved": 0, "parseErrors": 0,
   "refTotal": 8566, "refResolved": 2208,  // outbound links; those into shipped packs resolved to id
   "danglingRefs": 0, "ambiguousNames": 0  // health signals — both expected to be 0
@@ -176,7 +202,8 @@ rules an item applies when activated; equipment references them by `kind:"effect
   (`v14-dev` → `v15-dev` → …). Major-version bumps are picked up automatically; `meta.json`
   records the resolved branch + commit SHA.
 - **Sparse + shallow checkout** of just `packs/pf2e/equipment`, `packs/pf2e/equipment-effects`
-  and `static/icons` (git-native, no API rate limits, no HTTP client). equipment-effects is
+  `static/icons`, the English localization, and trait configuration (git-native, no API rate
+  limits, no HTTP client). equipment-effects is
   optional: if absent, the build still succeeds and effect links simply stay unresolved.
 - **Icons** are deduped by SHA-256 of their bytes and copied as-is (no re-encoding).
   `systems/pf2e/icons/…` resolves to `static/icons/…`; bare `icons/…` (Foundry core art absent

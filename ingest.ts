@@ -44,10 +44,12 @@ const EQUIPMENT_EFFECTS_DIR = path.join(PF2E_SRC, "packs", "pf2e", "equipment-ef
 const STATIC_DIR = path.join(PF2E_SRC, "static");
 const DEFAULT_ICONS_DIR = path.join(STATIC_DIR, "icons", "default-icons");
 const ICONS_OUT_DIR = path.join(OUT_DIR, "icons");
+const TRAITS_CONFIG = path.join(PF2E_SRC, "src", "scripts", "config", "traits.ts");
+const EN_LOCALIZATION = path.join(PF2E_SRC, "static", "lang", "en.json");
 
-// v3: per-record mechanical `stats` block (weapon/armor/shield/consumable) + common bulk/usage/
-// material; embedded consumable spells surfaced as `kind:"spell"` references.
-const SCHEMA_VERSION = 3;
+// v4: normalized catalog-family blocks and trait metadata; the v3 stats/reference fields remain
+// available as compatibility data.
+const SCHEMA_VERSION = 4;
 
 // PF2e coin denominations expressed in copper (the smallest unit).
 const COPPER_PER: Record<string, number> = { pp: 1000, gp: 100, sp: 10, cp: 1 };
@@ -86,11 +88,6 @@ interface Reference {
 }
 
 /** Encumbrance. `value` is pf2e Bulk (0 = negligible, <1 = Light); `text` renders it ("—"/"L"/"3"). */
-interface Bulk {
-  value: number;
-  text: string;
-}
-
 /** A precious material and its grade (e.g. cold iron / standard). null when the item is mundane. */
 interface Material {
   type: string; // adamantine, cold-iron, silver, dawnsilver, …
@@ -184,19 +181,67 @@ interface EquipmentRecord {
   quantity: number;
   publicationTitle: string | null;
   remaster: boolean;
+  source: { title: string; remaster: boolean } | null;
   baseItem: string | null;
-  /** pf2e Bulk. null only if the field is absent (defensive; equipment always carries it). */
-  bulk: Bulk | null;
-  /** How the item is worn/held/affixed, humanized (e.g. "held in one hand", "etched onto weapon"). */
+  bulk: number | null;
   usage: string | null;
+  hands: number | null;
   /** Precious material + grade, or null when mundane. */
   material: Material | null;
+  size: string | null;
+  hardness: number | null;
+  hp: number | null;
+  category: string | null;
+  group: string | null;
+  weapon?: CatalogWeapon;
+  armor?: CatalogArmor;
+  consumable?: CatalogConsumable;
   /** Mechanical stat block, shape keyed by `type`; null for types without one. See ItemStats. */
   stats: ItemStats | null;
   /** Filename within the bundle's icons/ dir, e.g. "ab12…f.webp"; null if unresolved. */
   img: string | null;
   /** Deduped outbound links from the description; see Reference. */
   references: Reference[];
+}
+
+interface CatalogWeapon {
+  damageDice: number | null;
+  damageDie: string | null;
+  damageType: string | null;
+  range: number | null;
+  reload: number | null;
+  canBeAmmo: boolean;
+  splashDamage: number | null;
+  potency: number;
+  striking: number;
+  propertyRunes: string[];
+}
+
+interface CatalogArmor {
+  acBonus: number;
+  dexCap: number;
+  checkPenalty: number;
+  speedPenalty: number;
+  strength: number | null;
+  potency: number;
+  resilient: number;
+  propertyRunes: string[];
+}
+
+interface CatalogConsumable {
+  category: string | null;
+  uses: number;
+  maxUses: number;
+  effectKind: "damage" | "healing" | null;
+  formula: string | null;
+  damageType: string | null;
+}
+
+interface TraitRecord {
+  slug: string;
+  label: string;
+  description: string | null;
+  group: string | null;
 }
 
 /** How long an effect lasts. `value` is in `unit`s (-1 / "unlimited" = indefinite). */
@@ -244,14 +289,16 @@ interface RawDoc {
     traits?: { rarity?: string; value?: string[] };
     // --- v3 mechanical fields (all optional; shapes vary by item type) ---
     bulk?: { value?: number };
-    usage?: { value?: string };
+    usage?: { value?: string; hands?: number | string; canBeAmmo?: boolean };
     material?: { type?: string | null; grade?: string | null };
+    size?: string;
     // weapon
     damage?: { damageType?: string; dice?: number; die?: string; formula?: string; type?: string };
     category?: string; // weapon / armor / consumable proficiency-or-kind
     group?: string | null; // weapon / armor group
     range?: number | null; // weapon range increment
     reload?: { value?: string | number };
+    splashDamage?: { value?: number } | number;
     runes?: {
       potency?: number;
       striking?: number;
@@ -308,21 +355,20 @@ function normalizeDuration(
   };
 }
 
-/** pf2e Bulk -> value + display text ("—" negligible, "L" light, else the number). */
-function normalizeBulk(raw: { value?: number } | undefined): Bulk | null {
-  const value = typeof raw?.value === "number" ? raw.value : null;
-  if (value === null) return null;
-  const text = value === 0 ? "—" : value < 1 ? "L" : String(value);
-  return { value, text };
+function normalizeBulk(raw: { value?: number } | undefined): number | null {
+  return typeof raw?.value === "number" ? raw.value : null;
 }
 
-/** Foundry usage slug -> a humanized phrase ("held-in-one-hand" -> "held in one hand"). */
 function normalizeUsage(raw: { value?: string } | undefined): string | null {
-  let v = raw?.value?.trim();
-  if (!v) return null;
-  // Legacy concatenated slugs like "wornamulet"/"wornbackpack" -> "worn amulet".
-  if (/^worn[a-z]/.test(v)) v = "worn-" + v.slice(4);
-  return v.replace(/-/g, " ");
+  const value = raw?.value?.trim();
+  return value || null;
+}
+
+function normalizeHands(raw: number | string | undefined): number | null {
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw !== "string") return null;
+  const match = /^\d+/.exec(raw.trim());
+  return match ? Number(match[0]) : null;
 }
 
 /** Precious-material block -> {type, grade}, or null when the item is mundane. */
@@ -360,6 +406,55 @@ function normalizeReload(raw: { value?: string | number } | undefined): string |
   if (raw?.value == null) return null;
   const s = String(raw.value).trim();
   return s === "" || s === "-" ? null : s;
+}
+
+function numericReload(raw: { value?: string | number } | undefined): number | null {
+  const value = normalizeReload(raw);
+  if (value === null || !/^\d+$/.test(value)) return null;
+  return Number(value);
+}
+
+function catalogWeapon(sys: NonNullable<RawDoc["system"]>): CatalogWeapon {
+  const splash = typeof sys.splashDamage === "number" ? sys.splashDamage : sys.splashDamage?.value;
+  return {
+    damageDice: typeof sys.damage?.dice === "number" ? sys.damage.dice : null,
+    damageDie: sys.damage?.die ?? null,
+    damageType: sys.damage?.damageType ?? null,
+    range: typeof sys.range === "number" ? sys.range : null,
+    reload: numericReload(sys.reload),
+    canBeAmmo: Boolean(sys.usage?.canBeAmmo),
+    splashDamage: typeof splash === "number" ? splash : null,
+    potency: sys.runes?.potency ?? 0,
+    striking: sys.runes?.striking ?? 0,
+    propertyRunes: sys.runes?.property ?? [],
+  };
+}
+
+function catalogArmor(sys: NonNullable<RawDoc["system"]>): CatalogArmor {
+  return {
+    acBonus: sys.acBonus ?? 0,
+    dexCap: sys.dexCap ?? 0,
+    checkPenalty: sys.checkPenalty ?? 0,
+    speedPenalty: sys.speedPenalty ?? 0,
+    strength: typeof sys.strength === "number" ? sys.strength : null,
+    potency: sys.runes?.potency ?? 0,
+    resilient: sys.runes?.resilient ?? 0,
+    propertyRunes: sys.runes?.property ?? [],
+  };
+}
+
+function catalogConsumable(sys: NonNullable<RawDoc["system"]>): CatalogConsumable {
+  const maxUses = typeof sys.uses?.max === "number" && sys.uses.max > 0 ? sys.uses.max : 1;
+  const uses = typeof sys.uses?.value === "number" ? sys.uses.value : maxUses;
+  const formula = sys.damage?.formula ?? null;
+  return {
+    category: sys.category ?? null,
+    uses,
+    maxUses,
+    effectKind: formula ? "damage" : sys.traits?.value?.includes("healing") ? "healing" : null,
+    formula,
+    damageType: formula ? (sys.damage?.type ?? null) : null,
+  };
 }
 
 type RawRunes = {
@@ -660,6 +755,63 @@ function cleanDescription(
   return { html: out.replace(/\s+/g, " ").trim(), references, dangling };
 }
 
+function localizationValue(root: unknown, dottedKey: string): string | null {
+  let value: unknown = root;
+  for (const part of dottedKey.split(".")) {
+    if (!value || typeof value !== "object") return null;
+    value = (value as Record<string, unknown>)[part];
+  }
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function directTraitEntries(source: string, objectName: string): Map<string, string> {
+  const declaration = new RegExp(`const ${objectName}(?:\\s*:[^=]+)?\\s*=\\s*\\{`).exec(source);
+  if (!declaration) return new Map();
+  const start = declaration.index + declaration[0].length;
+  const end = source.indexOf("\n};", start);
+  if (end < 0) return new Map();
+  const entries = new Map<string, string>();
+  const pattern = /^\s*(?:"([^"]+)"|([a-zA-Z][\w-]*)):\s*"(PF2E\.[^"]+)"/gm;
+  for (const match of source.slice(start, end).matchAll(pattern)) {
+    entries.set(match[1] ?? match[2], match[3]);
+  }
+  return entries;
+}
+
+async function buildTraits(slugs: Set<string>): Promise<TraitRecord[]> {
+  const [config, localizationText] = await Promise.all([
+    readFile(TRAITS_CONFIG, "utf8"),
+    readFile(EN_LOCALIZATION, "utf8"),
+  ]);
+  const localization = JSON.parse(localizationText) as unknown;
+  const families = ["equipmentTraits", "weaponTraits", "armorTraits", "consumableTraits", "shieldTraits"];
+  const familyMaps = new Map(families.map((name) => [name, directTraitEntries(config, name)]));
+  const descriptions = directTraitEntries(config, "traitDescriptions");
+  const allLabels = new Map<string, string>();
+  const labelPattern = /^\s*(?:"([^"]+)"|([a-zA-Z][\w-]*)):\s*"(PF2E\.Trait(?!Description)[^"]+)"/gm;
+  for (const match of config.matchAll(labelPattern)) allLabels.set(match[1] ?? match[2], match[3]);
+  for (const family of familyMaps.values()) {
+    for (const [slug, key] of family) allLabels.set(slug, key);
+  }
+
+  return [...slugs].sort().map((slug) => {
+    const labelKey = allLabels.get(slug);
+    const label = labelKey ? localizationValue(localization, labelKey) : null;
+    if (!label) throw new Error(`No localized label configured for referenced trait: ${slug}`);
+    const descriptionKey = descriptions.get(slug);
+    const memberships = families.filter((family) => familyMaps.get(family)?.has(slug));
+    const group = memberships.length === 1
+      ? memberships[0].replace(/Traits$/, "").replace(/^equipment$/, "general")
+      : memberships.length > 1 ? "general" : null;
+    return {
+      slug,
+      label,
+      description: descriptionKey ? localizationValue(localization, descriptionKey) : null,
+      group,
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -796,10 +948,22 @@ async function main(): Promise<void> {
         ...common,
         price: normalizePrice(sys.price),
         quantity: sys.quantity ?? 1,
+        source: sys.publication?.title
+          ? { title: sys.publication.title, remaster: Boolean(sys.publication.remaster) }
+          : null,
         baseItem: sys.baseItem ?? null,
         bulk: normalizeBulk(sys.bulk),
         usage: normalizeUsage(sys.usage),
+        hands: normalizeHands(sys.usage?.hands),
         material: normalizeMaterial(sys.material),
+        size: sys.size ?? null,
+        hardness: typeof sys.hardness === "number" ? sys.hardness : null,
+        hp: typeof sys.hp?.max === "number" ? sys.hp.max : null,
+        category: sys.category ?? null,
+        group: sys.group ?? null,
+        ...(type === "weapon" ? { weapon: catalogWeapon(sys) } : {}),
+        ...(type === "armor" ? { armor: catalogArmor(sys) } : {}),
+        ...(type === "consumable" ? { consumable: catalogConsumable(sys) } : {}),
         stats: buildStats(type, sys),
       });
     }
@@ -808,6 +972,8 @@ async function main(): Promise<void> {
   const byId = (a: { id: string }, b: { id: string }) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   records.sort(byId);
   effects.sort(byId);
+  const traitSlugs = new Set(records.flatMap((record) => record.traits));
+  const traits = await buildTraits(traitSlugs);
 
   // Reference tallies for provenance: how many links we surfaced and how many resolved in-bundle.
   // `danglingRefs` (a health signal, expected 0) is accumulated above from links that pointed at
@@ -825,6 +991,7 @@ async function main(): Promise<void> {
 
   await writeFile(path.join(OUT_DIR, "equipment.json"), JSON.stringify(records));
   await writeFile(path.join(OUT_DIR, "effects.json"), JSON.stringify(effects));
+  await writeFile(path.join(OUT_DIR, "traits.json"), JSON.stringify(traits));
 
   const meta = {
     schemaVersion: SCHEMA_VERSION,
@@ -833,6 +1000,7 @@ async function main(): Promise<void> {
     upstreamSha: UPSTREAM_SHA,
     generatedAt: new Date().toISOString(),
     itemCount: records.length,
+    traitCount: traits.length,
     effectCount: effects.length,
     iconCount: writtenIcons.size,
     realIcons,

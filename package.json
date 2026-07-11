@@ -5,7 +5,9 @@
   "type": "module",
   "description": "Daily ingest of Foundry VTT PF2e equipment into a slim, self-contained search bundle (equipment.json + deduped icons) published as a GitHub Release asset.",
   "scripts": {
-    "ingest": "tsx ingest.ts"
+    "ingest": "tsx ingest.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "sanitize-html": "^2.13.1"
